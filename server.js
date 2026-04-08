@@ -14,19 +14,36 @@ const BASE_URL =
   process.env.CUSTOMS_API_URL ||
   "https://apis.data.go.kr/1220000/sidoitemtrade/getSidoitemtradeList";
 
-// 숫자 정리
+const REGION_NAME_MAP = {
+  "11": "서울",
+  "26": "부산",
+  "27": "대구",
+  "28": "인천",
+  "29": "광주",
+  "30": "대전",
+  "31": "울산",
+  "36": "세종",
+  "41": "경기",
+  "42": "강원",
+  "43": "충북",
+  "44": "충남",
+  "45": "전북",
+  "46": "전남",
+  "47": "경북",
+  "48": "경남",
+  "50": "제주"
+};
+
 function cleanNumber(value) {
   if (value === undefined || value === null || value === "") return 0;
   return Number(String(value).replace(/,/g, "").trim()) || 0;
 }
 
-// 배열 변환
 function asArray(v) {
   if (!v) return [];
   return Array.isArray(v) ? v : [v];
 }
 
-// YYYYMM 목록 생성
 function getMonthRange(from, to) {
   const result = [];
   let y = Number(String(from).slice(0, 4));
@@ -45,7 +62,6 @@ function getMonthRange(from, to) {
   return result;
 }
 
-// 응답 파싱
 async function parseApiResponse(data) {
   try {
     return JSON.parse(data);
@@ -54,12 +70,10 @@ async function parseApiResponse(data) {
   }
 }
 
-// 아이템 추출
 function extractItems(parsed) {
   return asArray(parsed?.response?.body?.items?.item);
 }
 
-// 헤더 추출
 function extractHeader(parsed) {
   const h = parsed?.response?.header || {};
   return {
@@ -68,7 +82,6 @@ function extractHeader(parsed) {
   };
 }
 
-// 원본 아이템 매핑
 function mapItem(item) {
   return {
     period: item.priodTitle || "",
@@ -84,7 +97,6 @@ function mapItem(item) {
   };
 }
 
-// 단일 월 데이터 가져오기
 async function fetchTradeMonth({ yymm, hsSgn = "", sidoCd = "" }) {
   const serviceKey = process.env.CUSTOMS_SERVICE_KEY;
 
@@ -115,22 +127,72 @@ async function fetchTradeMonth({ yymm, hsSgn = "", sidoCd = "" }) {
   };
 }
 
-// 서버 확인
+function getCurrentYymm() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  return `${year}${month}`;
+}
+
+function getPrevYymm(yymm) {
+  let y = Number(String(yymm).slice(0, 4));
+  let m = Number(String(yymm).slice(4, 6));
+  m -= 1;
+  if (m < 1) {
+    m = 12;
+    y -= 1;
+  }
+  return `${y}${String(m).padStart(2, "0")}`;
+}
+
+async function findLatestAvailableYymm({ hsSgn = "", sidoCd = "", maxLookback = 12 }) {
+  let current = getCurrentYymm();
+
+  for (let i = 0; i < maxLookback; i++) {
+    try {
+      const result = await fetchTradeMonth({ yymm: current, hsSgn, sidoCd });
+      const hasUsefulData = result.items.some(
+        (item) =>
+          item.export_usd > 0 ||
+          item.import_usd > 0 ||
+          item.trade_balance_usd !== 0 ||
+          item.export_count > 0 ||
+          item.import_count > 0
+      );
+
+      if (hasUsefulData) {
+        return current;
+      }
+    } catch (e) {
+      // 무시하고 이전 월로 이동
+    }
+    current = getPrevYymm(current);
+  }
+
+  return getPrevYymm(getCurrentYymm());
+}
+
 app.get("/", (req, res) => {
   res.json({ ok: true, message: "Railway trade API is running" });
 });
 
-// 기존 상세 데이터 API
 app.get("/api/export-data", async (req, res) => {
   try {
+    const hsSgn = req.query.hsSgn || "";
+    const sidoCd = req.query.sidoCd || "";
+    const latestYymm = await findLatestAvailableYymm({ hsSgn, sidoCd });
+
+    const yymm = req.query.strtYymm || latestYymm;
+
     const result = await fetchTradeMonth({
-      yymm: req.query.strtYymm || "202501",
-      hsSgn: req.query.hsSgn || "",
-      sidoCd: req.query.sidoCd || ""
+      yymm,
+      hsSgn,
+      sidoCd
     });
 
     res.json({
       success: true,
+      latest_yymm: latestYymm,
       resultCode: result.header.resultCode,
       resultMsg: result.header.resultMsg,
       count: result.items.length,
@@ -144,13 +206,13 @@ app.get("/api/export-data", async (req, res) => {
   }
 });
 
-// 신규 월별 시계열 API
 app.get("/api/export-timeseries", async (req, res) => {
   try {
     const hsSgn = req.query.hsSgn || "";
     const sidoCd = req.query.sidoCd || "";
     const from = req.query.from || "202401";
-    const to = req.query.to || "202503";
+    const latestYymm = await findLatestAvailableYymm({ hsSgn, sidoCd });
+    const to = req.query.to || latestYymm;
 
     const months = getMonthRange(from, to);
     const rows = [];
@@ -158,7 +220,6 @@ app.get("/api/export-timeseries", async (req, res) => {
     for (const yymm of months) {
       const result = await fetchTradeMonth({ yymm, hsSgn, sidoCd });
 
-      // 총계행 또는 첫 번째 유효행 우선 사용
       let target =
         result.items.find((item) => !item.hs_code) ||
         result.items[0] ||
@@ -166,7 +227,7 @@ app.get("/api/export-timeseries", async (req, res) => {
           period: yymm,
           hs_code: hsSgn,
           region_code: sidoCd,
-          region_name: "",
+          region_name: REGION_NAME_MAP[sidoCd] || "",
           product_name: "",
           export_usd: 0,
           import_usd: 0,
@@ -175,7 +236,6 @@ app.get("/api/export-timeseries", async (req, res) => {
           import_count: 0
         };
 
-      // 총계행이 없고 세부행 여러 개면 합산
       if (result.items.length > 1 && target.hs_code) {
         const summed = result.items.reduce(
           (acc, cur) => {
@@ -185,12 +245,10 @@ app.get("/api/export-timeseries", async (req, res) => {
             acc.export_count += cur.export_count;
             acc.import_count += cur.import_count;
             if (!acc.product_name && cur.product_name) acc.product_name = cur.product_name;
-            if (!acc.region_name && cur.region_name) acc.region_name = cur.region_name;
             return acc;
           },
           {
             product_name: "",
-            region_name: "",
             export_usd: 0,
             import_usd: 0,
             trade_balance_usd: 0,
@@ -203,7 +261,7 @@ app.get("/api/export-timeseries", async (req, res) => {
           period: yymm,
           hs_code: hsSgn,
           region_code: sidoCd,
-          region_name: summed.region_name,
+          region_name: REGION_NAME_MAP[sidoCd] || "",
           product_name: summed.product_name,
           export_usd: summed.export_usd,
           import_usd: summed.import_usd,
@@ -217,7 +275,7 @@ app.get("/api/export-timeseries", async (req, res) => {
         yymm,
         hs_code: hsSgn,
         region_code: sidoCd,
-        region_name: target.region_name || "",
+        region_name: target.region_name || REGION_NAME_MAP[sidoCd] || "",
         product_name: target.product_name || "",
         export_usd: target.export_usd || 0,
         import_usd: target.import_usd || 0,
@@ -229,6 +287,7 @@ app.get("/api/export-timeseries", async (req, res) => {
 
     res.json({
       success: true,
+      latest_yymm: latestYymm,
       hsSgn,
       sidoCd,
       from,
@@ -244,7 +303,78 @@ app.get("/api/export-timeseries", async (req, res) => {
   }
 });
 
-// 서버 실행
+app.get("/api/export-by-region", async (req, res) => {
+  try {
+    const hsSgn = req.query.hsSgn || "";
+    const latestYymm = await findLatestAvailableYymm({ hsSgn });
+    const yymm = req.query.yymm || latestYymm;
+
+    const regionCodes = Object.keys(REGION_NAME_MAP);
+    const rows = [];
+
+    for (const code of regionCodes) {
+      try {
+        const result = await fetchTradeMonth({ yymm, hsSgn, sidoCd: code });
+
+        let exportUsd = 0;
+        let productName = "";
+
+        const totalRow = result.items.find((item) => !item.hs_code);
+
+        if (totalRow) {
+          exportUsd = totalRow.export_usd || 0;
+          productName = totalRow.product_name || "";
+        } else if (result.items.length > 0) {
+          exportUsd = result.items.reduce((sum, cur) => sum + (cur.export_usd || 0), 0);
+          productName = result.items.find((x) => x.product_name)?.product_name || "";
+        }
+
+        rows.push({
+          region_code: code,
+          region_name: REGION_NAME_MAP[code] || code,
+          hs_code: hsSgn,
+          product_name: productName,
+          export_usd: exportUsd
+        });
+      } catch (e) {
+        rows.push({
+          region_code: code,
+          region_name: REGION_NAME_MAP[code] || code,
+          hs_code: hsSgn,
+          product_name: "",
+          export_usd: 0
+        });
+      }
+    }
+
+    const filtered = rows
+      .filter((row) => row.export_usd > 0)
+      .sort((a, b) => b.export_usd - a.export_usd);
+
+    const totalExportUsd = filtered.reduce((sum, cur) => sum + cur.export_usd, 0);
+
+    const items = filtered.map((row) => ({
+      ...row,
+      share_pct: totalExportUsd > 0 ? Number(((row.export_usd / totalExportUsd) * 100).toFixed(2)) : 0
+    }));
+
+    res.json({
+      success: true,
+      latest_yymm: latestYymm,
+      yymm,
+      hsSgn,
+      total_export_usd: totalExportUsd,
+      count: items.length,
+      items
+    });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      message: e.message
+    });
+  }
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
