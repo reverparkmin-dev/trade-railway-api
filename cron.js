@@ -102,27 +102,34 @@ function mapItem(item) {
 }
 
 async function fetchTradeMonth({ yymm, hsSgn = "", sidoCd = "" }) {
-  const serviceKey = process.env.CUSTOMS_SERVICE_KEY;
+  try {
+    const serviceKey = process.env.CUSTOMS_SERVICE_KEY;
 
-  const params = {
-    serviceKey,
-    strtYymm: yymm,
-    endYymm: yymm,
-    numOfRows: "1000",
-    pageNo: "1"
-  };
+    const params = {
+      serviceKey,
+      strtYymm: yymm,
+      endYymm: yymm,
+      numOfRows: "1000",
+      pageNo: "1"
+    };
 
-  if (hsSgn) params.hsSgn = hsSgn;
-  if (sidoCd) params.sidoCd = sidoCd;
+    if (hsSgn) params.hsSgn = hsSgn;
+    if (sidoCd) params.sidoCd = sidoCd;
 
-  const response = await axios.get(BASE_URL, {
-    params,
-    timeout: 30000,
-    responseType: "text"
-  });
+    const response = await axios.get(BASE_URL, {
+      params,
+      timeout: 30000,
+      responseType: "text"
+    });
 
-  const parsed = await parseApiResponse(response.data);
-  return extractItems(parsed).map(mapItem);
+    const parsed = await parseApiResponse(response.data);
+    return extractItems(parsed).map(mapItem);
+  } catch (err) {
+    console.error(
+      `[fetchTradeMonth] failed yymm=${yymm} hsSgn=${hsSgn} sidoCd=${sidoCd}: ${err.message}`
+    );
+    return [];
+  }
 }
 
 function getCurrentYymm() {
@@ -145,18 +152,17 @@ async function findLatestAvailableYymm({ hsSgn = "", sidoCd = "", maxLookback = 
   let current = getCurrentYymm();
 
   for (let i = 0; i < maxLookback; i++) {
-    try {
-      const items = await fetchTradeMonth({ yymm: current, hsSgn, sidoCd });
-      const hasUsefulData = items.some(
-        (item) =>
-          item.export_usd > 0 ||
-          item.import_usd > 0 ||
-          item.trade_balance_usd !== 0 ||
-          item.export_count > 0 ||
-          item.import_count > 0
-      );
-      if (hasUsefulData) return current;
-    } catch (_) {}
+    const items = await fetchTradeMonth({ yymm: current, hsSgn, sidoCd });
+    const hasUsefulData = items.some(
+      (item) =>
+        item.export_usd > 0 ||
+        item.import_usd > 0 ||
+        item.trade_balance_usd !== 0 ||
+        item.export_count > 0 ||
+        item.import_count > 0
+    );
+    if (hasUsefulData) return current;
+
     current = getPrevYymm(current);
   }
 
@@ -422,7 +428,6 @@ async function buildOneHs(client, hsSgn, from = "202401") {
         });
       } else {
         const items = await fetchTradeMonth({ yymm, hsSgn, sidoCd: code });
-
         const target = pickTotalLikeRow(items);
 
         if (yymm === latestYymm) {
@@ -455,24 +460,14 @@ async function buildOneHs(client, hsSgn, from = "202401") {
       items: timeseries
     };
 
-    const detailPayload =
-      code === "ALL"
-        ? {
-            success: true,
-            latest_yymm: latestYymm,
-            hsSgn,
-            sidoCd: "ALL",
-            count: latestDetailItems.length,
-            items: latestDetailItems
-          }
-        : {
-            success: true,
-            latest_yymm: latestYymm,
-            hsSgn,
-            sidoCd: code,
-            count: latestDetailItems.length,
-            items: latestDetailItems
-          };
+    const detailPayload = {
+      success: true,
+      latest_yymm: latestYymm,
+      hsSgn,
+      sidoCd: code === "ALL" ? "ALL" : code,
+      count: latestDetailItems.length,
+      items: latestDetailItems
+    };
 
     await upsertTimeseries(client, hsSgn, code, latestYymm, timeseriesPayload);
     await upsertDetail(client, hsSgn, code, latestYymm, detailPayload);
@@ -490,24 +485,34 @@ async function main() {
     ssl: { rejectUnauthorized: false }
   });
 
-  await client.connect();
-  await createTables(client);
+  try {
+    await client.connect();
+    await createTables(client);
 
-  const results = [];
-  for (const hs of HS_LIST) {
-    console.log(`Building cache for ${hs}...`);
-    const result = await buildOneHs(client, hs, "202401");
-    results.push(result);
+    const results = [];
+
+    for (const hs of HS_LIST) {
+      console.log(`Building cache for ${hs}...`);
+
+      try {
+        const result = await buildOneHs(client, hs, "202401");
+        results.push(result);
+        console.log(`✅ Completed ${hs}`);
+      } catch (err) {
+        console.error(`❌ ERROR on HS ${hs}:`, err.message);
+      }
+    }
+
+    await upsertMeta(client, "latest", {
+      success: true,
+      generated_at: new Date().toISOString(),
+      items: results
+    });
+
+    console.log("Cron build completed.");
+  } finally {
+    await client.end().catch(() => {});
   }
-
-  await upsertMeta(client, "latest", {
-    success: true,
-    generated_at: new Date().toISOString(),
-    items: results
-  });
-
-  await client.end();
-  console.log("Cron build completed.");
 }
 
 main()
