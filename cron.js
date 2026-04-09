@@ -51,6 +51,29 @@ function cleanNumber(value) {
   return Number(String(value).replace(/,/g, "").trim()) || 0;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, options, maxRetries = 4) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await axios.get(url, options);
+    } catch (err) {
+      const status = err?.response?.status;
+
+      if (status === 429 && attempt < maxRetries) {
+        const waitMs = 2000 * (attempt + 1);
+        console.warn(`[429] retry after ${waitMs}ms`);
+        await sleep(waitMs);
+        continue;
+      }
+
+      throw err;
+    }
+  }
+}
+
 function asArray(v) {
   if (!v) return [];
   return Array.isArray(v) ? v : [v];
@@ -116,7 +139,9 @@ async function fetchTradeMonth({ yymm, hsSgn = "", sidoCd = "" }) {
     if (hsSgn) params.hsSgn = hsSgn;
     if (sidoCd) params.sidoCd = sidoCd;
 
-    const response = await axios.get(BASE_URL, {
+    await sleep(250);
+
+    const response = await fetchWithRetry(BASE_URL, {
       params,
       timeout: 30000,
       responseType: "text"
@@ -498,6 +523,7 @@ async function main() {
         const result = await buildOneHs(client, hs, "202401");
         results.push(result);
         console.log(`✅ Completed ${hs}`);
+        await sleep(1500);
       } catch (err) {
         console.error(`❌ ERROR on HS ${hs}:`, err.message);
       }
