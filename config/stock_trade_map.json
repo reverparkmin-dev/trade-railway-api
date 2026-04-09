@@ -1,0 +1,8 @@
+{
+  "gst": {
+    "name": "GST",
+    "filters": [
+      { "hs_code": "842139", "region_code": "41", "region_name": "경기" }
+    ]
+  }
+}
