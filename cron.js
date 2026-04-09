@@ -29,6 +29,7 @@ const REGION_NAME_MAP = {
 
 const CORE_REGION_CODES = ["11", "28", "31", "41", "43", "44", "47", "48"];
 
+// 운영 시 여기만 늘리면 됨
 const HS_LIST = [
   "854231",
   "854232",
@@ -46,6 +47,14 @@ const HS_LIST = [
   "854129"
 ];
 
+// 시작 월은 필요하면 환경변수로 조절 가능
+const DEFAULT_FROM_YYMM = process.env.TRADE_FROM_YYMM || "202401";
+
+// 호출 속도 제어
+const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 120);
+const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 500);
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
+
 function cleanNumber(value) {
   if (value === undefined || value === null || value === "") return 0;
   return Number(String(value).replace(/,/g, "").trim()) || 0;
@@ -55,16 +64,22 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url, options, maxRetries = 4) {
+async function fetchWithRetry(url, options, maxRetries = MAX_RETRIES) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await axios.get(url, options);
     } catch (err) {
       const status = err?.response?.status;
+      const waitMs = 1500 * (attempt + 1);
 
       if (status === 429 && attempt < maxRetries) {
-        const waitMs = 2000 * (attempt + 1);
         console.warn(`[429] retry after ${waitMs}ms`);
+        await sleep(waitMs);
+        continue;
+      }
+
+      if (attempt < maxRetries && !status) {
+        console.warn(`[network] retry after ${waitMs}ms: ${err.message}`);
         await sleep(waitMs);
         continue;
       }
@@ -139,7 +154,7 @@ async function fetchTradeMonth({ yymm, hsSgn = "", sidoCd = "" }) {
     if (hsSgn) params.hsSgn = hsSgn;
     if (sidoCd) params.sidoCd = sidoCd;
 
-    await sleep(250);
+    await sleep(REQUEST_DELAY_MS);
 
     const response = await fetchWithRetry(BASE_URL, {
       params,
@@ -173,21 +188,29 @@ function getPrevYymm(yymm) {
   return `${y}${String(m).padStart(2, "0")}`;
 }
 
-async function findLatestAvailableYymm({ hsSgn = "", sidoCd = "", maxLookback = 12 }) {
+async function findLatestAvailableYymm({ hsSgn = "", maxLookback = 12 }) {
   let current = getCurrentYymm();
 
   for (let i = 0; i < maxLookback; i++) {
-    const items = await fetchTradeMonth({ yymm: current, hsSgn, sidoCd });
-    const hasUsefulData = items.some(
-      (item) =>
-        item.export_usd > 0 ||
-        item.import_usd > 0 ||
-        item.trade_balance_usd !== 0 ||
-        item.export_count > 0 ||
-        item.import_count > 0
-    );
-    if (hasUsefulData) return current;
+    let hasUsefulData = false;
 
+    for (const regionCode of CORE_REGION_CODES) {
+      const items = await fetchTradeMonth({ yymm: current, hsSgn, sidoCd: regionCode });
+      const target = pickTotalLikeRow(items);
+
+      if (
+        target.export_usd > 0 ||
+        target.import_usd > 0 ||
+        target.trade_balance_usd !== 0 ||
+        target.export_count > 0 ||
+        target.import_count > 0
+      ) {
+        hasUsefulData = true;
+        break;
+      }
+    }
+
+    if (hasUsefulData) return current;
     current = getPrevYymm(current);
   }
 
@@ -297,91 +320,67 @@ function pickTotalLikeRow(items) {
   );
 }
 
-async function fetchAllRegionsMonthSummary(yymm, hsSgn) {
-  const regionSummaries = [];
+async function buildOneHs(client, hsSgn, from = DEFAULT_FROM_YYMM) {
+  const latestYymm = await findLatestAvailableYymm({ hsSgn });
+  const months = getMonthRange(from, latestYymm);
 
-  for (const regionCode of CORE_REGION_CODES) {
-    const items = await fetchTradeMonth({ yymm, hsSgn, sidoCd: regionCode });
-    const target = pickTotalLikeRow(items);
+  // month x region 데이터를 딱 1번씩만 저장
+  const monthRegionMap = {};
+  let productNameFallback = "";
 
-    regionSummaries.push({
+  for (const yymm of months) {
+    monthRegionMap[yymm] = {};
+
+    for (const regionCode of CORE_REGION_CODES) {
+      const items = await fetchTradeMonth({ yymm, hsSgn, sidoCd: regionCode });
+      const target = pickTotalLikeRow(items);
+
+      if (!productNameFallback && target.product_name) {
+        productNameFallback = target.product_name;
+      }
+
+      monthRegionMap[yymm][regionCode] = {
+        summary: {
+          yymm,
+          hs_code: hsSgn,
+          region_code: regionCode,
+          region_name: REGION_NAME_MAP[regionCode] || regionCode,
+          product_name: target.product_name || productNameFallback || "",
+          export_usd: target.export_usd || 0,
+          import_usd: target.import_usd || 0,
+          trade_balance_usd: target.trade_balance_usd || 0,
+          export_count: target.export_count || 0,
+          import_count: target.import_count || 0
+        },
+        detailItems: items
+      };
+    }
+  }
+
+  // 최신월 지역 요약
+  const latestRegionRows = CORE_REGION_CODES.map((regionCode) => {
+    const row = monthRegionMap[latestYymm]?.[regionCode]?.summary;
+    return {
       region_code: regionCode,
       region_name: REGION_NAME_MAP[regionCode] || regionCode,
       hs_code: hsSgn,
-      product_name: target.product_name || "",
-      export_usd: target.export_usd || 0,
-      import_usd: target.import_usd || 0,
-      trade_balance_usd: target.trade_balance_usd || 0,
-      export_count: target.export_count || 0,
-      import_count: target.import_count || 0
-    });
-  }
-
-  const total = regionSummaries.reduce(
-    (acc, cur) => {
-      acc.export_usd += cur.export_usd || 0;
-      acc.import_usd += cur.import_usd || 0;
-      acc.trade_balance_usd += cur.trade_balance_usd || 0;
-      acc.export_count += cur.export_count || 0;
-      acc.import_count += cur.import_count || 0;
-      if (!acc.product_name && cur.product_name) acc.product_name = cur.product_name;
-      return acc;
-    },
-    {
-      product_name: "",
-      export_usd: 0,
-      import_usd: 0,
-      trade_balance_usd: 0,
-      export_count: 0,
-      import_count: 0
-    }
-  );
-
-  return {
-    summary: total,
-    regions: regionSummaries
-  };
-}
-
-async function buildOneHs(client, hsSgn, from = "202401") {
-  const latestYymm = await findLatestAvailableYymm({ hsSgn });
-
-  const regionRows = [];
-
-  for (const code of CORE_REGION_CODES) {
-    const items = await fetchTradeMonth({ yymm: latestYymm, hsSgn, sidoCd: code });
-
-    let exportUsd = 0;
-    let productName = "";
-
-    const totalRow = items.find((item) => !item.hs_code);
-
-    if (totalRow) {
-      exportUsd = totalRow.export_usd || 0;
-      productName = totalRow.product_name || "";
-    } else if (items.length > 0) {
-      exportUsd = items.reduce((sum, cur) => sum + (cur.export_usd || 0), 0);
-      productName = items.find((x) => x.product_name)?.product_name || "";
-    }
-
-    regionRows.push({
-      region_code: code,
-      region_name: REGION_NAME_MAP[code] || code,
-      hs_code: hsSgn,
-      product_name: productName,
-      export_usd: exportUsd
-    });
-  }
-
-  const totalAll = regionRows.reduce((sum, cur) => sum + (cur.export_usd || 0), 0);
-
-  regionRows.unshift({
-    region_code: "ALL",
-    region_name: "전체",
-    hs_code: hsSgn,
-    product_name: regionRows.find((row) => row.product_name)?.product_name || "",
-    export_usd: totalAll
+      product_name: row?.product_name || productNameFallback || "",
+      export_usd: row?.export_usd || 0
+    };
   });
+
+  const totalAllLatest = latestRegionRows.reduce((sum, cur) => sum + (cur.export_usd || 0), 0);
+
+  const regionRows = [
+    {
+      region_code: "ALL",
+      region_name: "전체",
+      hs_code: hsSgn,
+      product_name: productNameFallback || "",
+      export_usd: totalAllLatest
+    },
+    ...latestRegionRows
+  ];
 
   const regionFiltered = regionRows
     .filter((row) => row.export_usd > 0)
@@ -391,9 +390,7 @@ async function buildOneHs(client, hsSgn, from = "202401") {
       return b.export_usd - a.export_usd;
     });
 
-  const totalExportUsd = regionFiltered
-    .filter((row) => row.region_code !== "ALL")
-    .reduce((sum, cur) => sum + cur.export_usd, 0);
+  const totalExportUsd = latestRegionRows.reduce((sum, cur) => sum + (cur.export_usd || 0), 0);
 
   const regionPayload = {
     success: true,
@@ -414,71 +411,16 @@ async function buildOneHs(client, hsSgn, from = "202401") {
 
   await upsertRegion(client, hsSgn, latestYymm, regionPayload);
 
-  for (const code of ["ALL", ...CORE_REGION_CODES]) {
-    const months = getMonthRange(from, latestYymm);
-    const timeseries = [];
-    let latestDetailItems = [];
-
-    for (const yymm of months) {
-      if (code === "ALL") {
-        const allData = await fetchAllRegionsMonthSummary(yymm, hsSgn);
-        const target = allData.summary;
-
-        if (yymm === latestYymm) {
-          latestDetailItems = allData.regions.map((row) => ({
-            period: yymm,
-            region_code: row.region_code,
-            region_name: row.region_name,
-            hs_code: hsSgn,
-            product_name: row.product_name || "",
-            export_usd: row.export_usd || 0,
-            import_usd: row.import_usd || 0,
-            trade_balance_usd: row.trade_balance_usd || 0,
-            export_count: row.export_count || 0,
-            import_count: row.import_count || 0
-          }));
-        }
-
-        timeseries.push({
-          yymm,
-          hs_code: hsSgn,
-          region_code: "ALL",
-          region_name: "전체",
-          product_name: target.product_name || "",
-          export_usd: target.export_usd || 0,
-          import_usd: target.import_usd || 0,
-          trade_balance_usd: target.trade_balance_usd || 0,
-          export_count: target.export_count || 0,
-          import_count: target.import_count || 0
-        });
-      } else {
-        const items = await fetchTradeMonth({ yymm, hsSgn, sidoCd: code });
-        const target = pickTotalLikeRow(items);
-
-        if (yymm === latestYymm) {
-          latestDetailItems = items;
-        }
-
-        timeseries.push({
-          yymm,
-          hs_code: hsSgn,
-          region_code: code,
-          region_name: REGION_NAME_MAP[code] || code,
-          product_name: target.product_name || "",
-          export_usd: target.export_usd || 0,
-          import_usd: target.import_usd || 0,
-          trade_balance_usd: target.trade_balance_usd || 0,
-          export_count: target.export_count || 0,
-          import_count: target.import_count || 0
-        });
-      }
-    }
+  // 지역별 timeseries/detail 저장
+  for (const regionCode of CORE_REGION_CODES) {
+    const timeseries = months.map((yymm) => monthRegionMap[yymm][regionCode].summary);
+    const latestDetailItems = monthRegionMap[latestYymm][regionCode].detailItems || [];
 
     const timeseriesPayload = {
       success: true,
       latest_yymm: latestYymm,
       hsSgn,
-      sidoCd: code,
+      sidoCd: regionCode,
       from,
       to: latestYymm,
       count: timeseries.length,
@@ -489,14 +431,82 @@ async function buildOneHs(client, hsSgn, from = "202401") {
       success: true,
       latest_yymm: latestYymm,
       hsSgn,
-      sidoCd: code === "ALL" ? "ALL" : code,
+      sidoCd: regionCode,
       count: latestDetailItems.length,
       items: latestDetailItems
     };
 
-    await upsertTimeseries(client, hsSgn, code, latestYymm, timeseriesPayload);
-    await upsertDetail(client, hsSgn, code, latestYymm, detailPayload);
+    await upsertTimeseries(client, hsSgn, regionCode, latestYymm, timeseriesPayload);
+    await upsertDetail(client, hsSgn, regionCode, latestYymm, detailPayload);
   }
+
+  // ALL timeseries/detail 저장
+  const allTimeseries = months.map((yymm) => {
+    const allRows = CORE_REGION_CODES.map((regionCode) => monthRegionMap[yymm][regionCode].summary);
+
+    return allRows.reduce(
+      (acc, cur) => {
+        acc.export_usd += cur.export_usd || 0;
+        acc.import_usd += cur.import_usd || 0;
+        acc.trade_balance_usd += cur.trade_balance_usd || 0;
+        acc.export_count += cur.export_count || 0;
+        acc.import_count += cur.import_count || 0;
+        if (!acc.product_name && cur.product_name) acc.product_name = cur.product_name;
+        return acc;
+      },
+      {
+        yymm,
+        hs_code: hsSgn,
+        region_code: "ALL",
+        region_name: "전체",
+        product_name: productNameFallback || "",
+        export_usd: 0,
+        import_usd: 0,
+        trade_balance_usd: 0,
+        export_count: 0,
+        import_count: 0
+      }
+    );
+  });
+
+  const allLatestDetailItems = CORE_REGION_CODES.map((regionCode) => {
+    const row = monthRegionMap[latestYymm][regionCode].summary;
+    return {
+      period: latestYymm,
+      region_code: regionCode,
+      region_name: row.region_name,
+      hs_code: hsSgn,
+      product_name: row.product_name || "",
+      export_usd: row.export_usd || 0,
+      import_usd: row.import_usd || 0,
+      trade_balance_usd: row.trade_balance_usd || 0,
+      export_count: row.export_count || 0,
+      import_count: row.import_count || 0
+    };
+  });
+
+  const allTimeseriesPayload = {
+    success: true,
+    latest_yymm: latestYymm,
+    hsSgn,
+    sidoCd: "ALL",
+    from,
+    to: latestYymm,
+    count: allTimeseries.length,
+    items: allTimeseries
+  };
+
+  const allDetailPayload = {
+    success: true,
+    latest_yymm: latestYymm,
+    hsSgn,
+    sidoCd: "ALL",
+    count: allLatestDetailItems.length,
+    items: allLatestDetailItems
+  };
+
+  await upsertTimeseries(client, hsSgn, "ALL", latestYymm, allTimeseriesPayload);
+  await upsertDetail(client, hsSgn, "ALL", latestYymm, allDetailPayload);
 
   return {
     hsSgn,
@@ -520,13 +530,14 @@ async function main() {
       console.log(`Building cache for ${hs}...`);
 
       try {
-        const result = await buildOneHs(client, hs, "202401");
+        const result = await buildOneHs(client, hs, DEFAULT_FROM_YYMM);
         results.push(result);
         console.log(`✅ Completed ${hs}`);
-        await sleep(1500);
       } catch (err) {
         console.error(`❌ ERROR on HS ${hs}:`, err.message);
       }
+
+      await sleep(HS_DELAY_MS);
     }
 
     await upsertMeta(client, "latest", {
