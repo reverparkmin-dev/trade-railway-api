@@ -30,6 +30,7 @@ const REGION_NAME_MAP = {
 const CORE_REGION_CODES = ["11", "28", "31", "41", "43", "44", "47", "48"];
 
 const HS_LIST = [
+  "284190",
   "854231",
   "883224",
   "854232",
