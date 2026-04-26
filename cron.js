@@ -60,6 +60,7 @@ const HS_LIST = [
   "870324",
   "883224",
   "901890",
+  "940429",
 ];
 
 const DEFAULT_FROM_YYMM = process.env.TRADE_FROM_YYMM || "202401";
