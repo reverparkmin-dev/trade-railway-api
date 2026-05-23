@@ -69,13 +69,16 @@ const HS_LIST = [
   "870324",
   "883224",
   "901890",
-  "940429",
+  "940429"
 ];
 
 const DEFAULT_FROM_YYMM = process.env.TRADE_FROM_YYMM || "202401";
 const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 120);
 const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 500);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
+
+const GROWTH_MIN_AMOUNT_USD = Number(process.env.GROWTH_MIN_AMOUNT_USD || 10000000);
+const GROWTH_TOP_LIMIT = Number(process.env.GROWTH_TOP_LIMIT || 5);
 
 function cleanNumber(value) {
   if (value === undefined || value === null || value === "") return 0;
@@ -132,6 +135,7 @@ function getMonthRange(from, to) {
       y += 1;
     }
   }
+
   return result;
 }
 
@@ -203,12 +207,26 @@ function getCurrentYymm() {
 function getPrevYymm(yymm) {
   let y = Number(String(yymm).slice(0, 4));
   let m = Number(String(yymm).slice(4, 6));
+
   m -= 1;
+
   if (m < 1) {
     m = 12;
     y -= 1;
   }
+
   return `${y}${String(m).padStart(2, "0")}`;
+}
+
+function getPrevYearYymm(yymm) {
+  const y = Number(String(yymm).slice(0, 4)) - 1;
+  const m = String(yymm).slice(4, 6);
+  return `${y}${m}`;
+}
+
+function calcGrowthRate(current, base) {
+  if (!base || base <= 0) return null;
+  return Number((((current - base) / base) * 100).toFixed(2));
 }
 
 async function findLatestAvailableYymm({ hsSgn = "", maxLookback = 12 }) {
@@ -287,6 +305,15 @@ async function createTables(client) {
       updated_at TIMESTAMP DEFAULT NOW()
     )
   `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS trade_cache_growth_ranking (
+      ranking_key TEXT PRIMARY KEY,
+      latest_yymm TEXT NOT NULL,
+      payload JSONB NOT NULL,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
 }
 
 async function upsertMeta(client, key, value) {
@@ -334,6 +361,18 @@ async function upsertRegion(client, hsCode, latestYymm, payload) {
     DO UPDATE SET latest_yymm = EXCLUDED.latest_yymm, payload = EXCLUDED.payload, updated_at = NOW()
     `,
     [hsCode, latestYymm, JSON.stringify(payload)]
+  );
+}
+
+async function upsertGrowthRanking(client, latestYymm, payload) {
+  await client.query(
+    `
+    INSERT INTO trade_cache_growth_ranking (ranking_key, latest_yymm, payload, updated_at)
+    VALUES ('main', $1, $2::jsonb, NOW())
+    ON CONFLICT (ranking_key)
+    DO UPDATE SET latest_yymm = EXCLUDED.latest_yymm, payload = EXCLUDED.payload, updated_at = NOW()
+    `,
+    [latestYymm, JSON.stringify(payload)]
   );
 }
 
@@ -412,7 +451,9 @@ async function buildOneHs(client, hsSgn, from = DEFAULT_FROM_YYMM) {
   const { matrix, productNameFallback } = await collectHsMonthRegionData(hsSgn, months);
 
   const latestRegionRows = CORE_REGION_CODES.map((regionCode) => {
-    const row = matrix[latestYymm]?.[regionCode]?.summary || createEmptySummary(hsSgn, regionCode, latestYymm, productNameFallback);
+    const row =
+      matrix[latestYymm]?.[regionCode]?.summary ||
+      createEmptySummary(hsSgn, regionCode, latestYymm, productNameFallback);
 
     return {
       region_code: regionCode,
@@ -467,7 +508,10 @@ async function buildOneHs(client, hsSgn, from = DEFAULT_FROM_YYMM) {
 
   for (const regionCode of CORE_REGION_CODES) {
     const timeseries = months.map((yymm) => {
-      const row = matrix[yymm]?.[regionCode]?.summary || createEmptySummary(hsSgn, regionCode, yymm, productNameFallback);
+      const row =
+        matrix[yymm]?.[regionCode]?.summary ||
+        createEmptySummary(hsSgn, regionCode, yymm, productNameFallback);
+
       return {
         ...row,
         product_name: row.product_name || productNameFallback || ""
@@ -504,20 +548,28 @@ async function buildOneHs(client, hsSgn, from = DEFAULT_FROM_YYMM) {
     const summary = createEmptySummary(hsSgn, "ALL", yymm, productNameFallback);
 
     for (const regionCode of CORE_REGION_CODES) {
-      const row = matrix[yymm]?.[regionCode]?.summary || createEmptySummary(hsSgn, regionCode, yymm, productNameFallback);
+      const row =
+        matrix[yymm]?.[regionCode]?.summary ||
+        createEmptySummary(hsSgn, regionCode, yymm, productNameFallback);
+
       summary.export_usd += row.export_usd || 0;
       summary.import_usd += row.import_usd || 0;
       summary.trade_balance_usd += row.trade_balance_usd || 0;
       summary.export_count += row.export_count || 0;
       summary.import_count += row.import_count || 0;
-      if (!summary.product_name && row.product_name) summary.product_name = row.product_name;
+
+      if (!summary.product_name && row.product_name) {
+        summary.product_name = row.product_name;
+      }
     }
 
     return summary;
   });
 
   const allLatestDetailItems = CORE_REGION_CODES.map((regionCode) => {
-    const row = matrix[latestYymm]?.[regionCode]?.summary || createEmptySummary(hsSgn, regionCode, latestYymm, productNameFallback);
+    const row =
+      matrix[latestYymm]?.[regionCode]?.summary ||
+      createEmptySummary(hsSgn, regionCode, latestYymm, productNameFallback);
 
     return {
       period: latestYymm,
@@ -562,6 +614,111 @@ async function buildOneHs(client, hsSgn, from = DEFAULT_FROM_YYMM) {
   };
 }
 
+function findSeriesRow(items, yymm) {
+  return items.find((item) => String(item.yymm) === String(yymm)) || null;
+}
+
+async function buildGrowthRanking(client) {
+  console.log("Building growth ranking...");
+
+  const result = await client.query(
+    `
+    SELECT hs_code, latest_yymm, payload
+    FROM trade_cache_timeseries
+    WHERE region_code = 'ALL'
+    `
+  );
+
+  if (result.rows.length === 0) {
+    console.warn("[growth-ranking] no ALL timeseries rows");
+    return;
+  }
+
+  const latestYymm = result.rows
+    .map((row) => row.latest_yymm)
+    .filter(Boolean)
+    .sort()
+    .reverse()[0];
+
+  const prevMonthYymm = getPrevYymm(latestYymm);
+  const prevYearYymm = getPrevYearYymm(latestYymm);
+
+  const rows = [];
+
+  for (const row of result.rows) {
+    const payload = row.payload || {};
+    const items = Array.isArray(payload.items) ? payload.items : [];
+
+    const current = findSeriesRow(items, latestYymm);
+    const prevMonth = findSeriesRow(items, prevMonthYymm);
+    const prevYear = findSeriesRow(items, prevYearYymm);
+
+    if (!current) continue;
+
+    const currentAmount = cleanNumber(current.export_usd);
+    const prevMonthAmount = cleanNumber(prevMonth?.export_usd);
+    const prevYearAmount = cleanNumber(prevYear?.export_usd);
+
+    if (currentAmount < GROWTH_MIN_AMOUNT_USD) continue;
+
+    const momRate = calcGrowthRate(currentAmount, prevMonthAmount);
+    const yoyRate = calcGrowthRate(currentAmount, prevYearAmount);
+
+    rows.push({
+      hs_code: row.hs_code,
+      hs_name: current.product_name || "",
+      product_name: current.product_name || "",
+      latest_yymm: latestYymm,
+      current_amount_usd: currentAmount,
+      prev_month_yymm: prevMonthYymm,
+      prev_month_amount_usd: prevMonthAmount,
+      prev_year_yymm: prevYearYymm,
+      prev_year_amount_usd: prevYearAmount,
+      mom_rate: momRate,
+      yoy_rate: yoyRate
+    });
+  }
+
+  const yoy_top5 = rows
+    .filter((row) => row.yoy_rate !== null)
+    .sort((a, b) => b.yoy_rate - a.yoy_rate)
+    .slice(0, GROWTH_TOP_LIMIT);
+
+  const mom_top5 = rows
+    .filter((row) => row.mom_rate !== null)
+    .sort((a, b) => b.mom_rate - a.mom_rate)
+    .slice(0, GROWTH_TOP_LIMIT);
+
+  const yoy_bottom5 = rows
+    .filter((row) => row.yoy_rate !== null)
+    .sort((a, b) => a.yoy_rate - b.yoy_rate)
+    .slice(0, GROWTH_TOP_LIMIT);
+
+  const mom_bottom5 = rows
+    .filter((row) => row.mom_rate !== null)
+    .sort((a, b) => a.mom_rate - b.mom_rate)
+    .slice(0, GROWTH_TOP_LIMIT);
+
+  const payload = {
+    success: true,
+    latest_yymm: latestYymm,
+    prev_month_yymm: prevMonthYymm,
+    prev_year_yymm: prevYearYymm,
+    min_amount_usd: GROWTH_MIN_AMOUNT_USD,
+    top_limit: GROWTH_TOP_LIMIT,
+    generated_at: new Date().toISOString(),
+    total_candidates: rows.length,
+    yoy_top5,
+    mom_top5,
+    yoy_bottom5,
+    mom_bottom5
+  };
+
+  await upsertGrowthRanking(client, latestYymm, payload);
+
+  console.log("✅ Growth ranking completed.");
+}
+
 async function main() {
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
@@ -593,6 +750,8 @@ async function main() {
       generated_at: new Date().toISOString(),
       items: results
     });
+
+    await buildGrowthRanking(client);
 
     console.log("Cron build completed.");
   } finally {
