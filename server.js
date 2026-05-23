@@ -1,8 +1,6 @@
 const express = require("express");
 const cors = require("cors");
 const { Client } = require("pg");
-const fs = require("fs");
-const path = require("path");
 
 require("dotenv").config();
 
@@ -53,14 +51,11 @@ app.get("/cache/meta/latest", async (req, res) => {
     data.updated_at = result.rows[0].updated_at;
 
     res.json(data);
-
   } catch (e) {
-
     res.status(500).json({
       success: false,
       message: e.message
     });
-
   } finally {
     await client.end();
   }
@@ -97,14 +92,11 @@ app.get("/cache/detail", async (req, res) => {
     data.updated_at = result.rows[0].updated_at;
 
     res.json(data);
-
   } catch (e) {
-
     res.status(500).json({
       success: false,
       message: e.message
     });
-
   } finally {
     await client.end();
   }
@@ -141,14 +133,11 @@ app.get("/cache/timeseries", async (req, res) => {
     data.updated_at = result.rows[0].updated_at;
 
     res.json(data);
-
   } catch (e) {
-
     res.status(500).json({
       success: false,
       message: e.message
     });
-
   } finally {
     await client.end();
   }
@@ -183,14 +172,11 @@ app.get("/cache/region", async (req, res) => {
     data.updated_at = result.rows[0].updated_at;
 
     res.json(data);
-
   } catch (e) {
-
     res.status(500).json({
       success: false,
       message: e.message
     });
-
   } finally {
     await client.end();
   }
@@ -200,43 +186,51 @@ app.get("/cache/region", async (req, res) => {
 |--------------------------------------------------------------------------
 | 성장률 랭킹 API
 |--------------------------------------------------------------------------
+| 천만 달러 이상 품목 중 YoY / MoM 증가율 TOP5를 반환합니다.
+| 데이터는 cron.js에서 trade_cache_growth_ranking 테이블에 저장합니다.
+|--------------------------------------------------------------------------
 */
 
 app.get("/cache/growth-ranking", async (req, res) => {
+  const client = getPgClient();
 
   try {
+    await client.connect();
 
-    const filePath = path.join(
-      __dirname,
-      "data",
-      "trade-growth-ranking.json"
+    const result = await client.query(
+      `
+      SELECT payload, latest_yymm, updated_at
+      FROM trade_cache_growth_ranking
+      WHERE ranking_key = 'main'
+      LIMIT 1
+      `
     );
 
-    if (!fs.existsSync(filePath)) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: "trade-growth-ranking.json not found"
+        message: "growth ranking cache not found"
       });
     }
 
-    const raw = fs.readFileSync(filePath, "utf8");
+    const data = result.rows[0].payload;
 
-    const data = JSON.parse(raw);
+    data.latest_yymm = data.latest_yymm || result.rows[0].latest_yymm;
+    data.updated_at = result.rows[0].updated_at;
 
     res.json({
       success: true,
       ...data
     });
-
   } catch (e) {
-
     console.error("[growth-ranking]", e);
 
     res.status(500).json({
       success: false,
       message: e.message
     });
-
+  } finally {
+    await client.end();
   }
 });
 
