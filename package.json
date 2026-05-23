@@ -4,7 +4,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "cron": "node cron.js"
+    "cron": "node cron.js",
+    "build:growth-ranking": "node scripts/build-trade-growth-ranking.js"
   },
   "dependencies": {
     "axios": "^1.7.9",
