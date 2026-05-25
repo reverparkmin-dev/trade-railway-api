@@ -73,9 +73,9 @@ const HS_LIST = [
 ];
 
 const DEFAULT_FROM_YYMM = process.env.TRADE_FROM_YYMM || "202401";
-const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 120);
-const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 500);
-const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
+const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 1500);
+const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 5000);
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5);
 
 const GROWTH_MIN_AMOUNT_USD = Number(process.env.GROWTH_MIN_AMOUNT_USD || 500);
 const GROWTH_TOP_LIMIT = Number(process.env.GROWTH_TOP_LIMIT || 5);
@@ -97,7 +97,7 @@ async function fetchWithRetry(url, options, maxRetries = MAX_RETRIES) {
       const status = err?.response?.status;
 
       if (status === 429 && attempt < maxRetries) {
-        const waitMs = 1500 * (attempt + 1);
+        const waitMs = 15000 * (attempt + 1);
         console.warn(`[429] retry after ${waitMs}ms`);
         await sleep(waitMs);
         continue;
@@ -230,6 +230,10 @@ function calcGrowthRate(current, base) {
 }
 
 async function findLatestAvailableYymm({ hsSgn = "", maxLookback = 12 }) {
+  if (process.env.TRADE_FIXED_LATEST_YYMM) {
+    return process.env.TRADE_FIXED_LATEST_YYMM;
+  }
+
   let current = getCurrentYymm();
 
   for (let i = 0; i < maxLookback; i++) {
