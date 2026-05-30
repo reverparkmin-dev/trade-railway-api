@@ -448,8 +448,15 @@ async function collectHsMonthRegionData(hsSgn, months) {
   };
 }
 
-async function buildOneHs(client, hsSgn, from = DEFAULT_FROM_YYMM) {
-  const latestYymm = await findLatestAvailableYymm({ hsSgn });
+async function buildOneHs(
+  client,
+  hsSgn,
+  from = DEFAULT_FROM_YYMM,
+  latestYymmOverride = null
+) {
+  const latestYymm =
+  latestYymmOverride ||
+  await findLatestAvailableYymm({ hsSgn });
   const months = getMonthRange(from, latestYymm);
 
   const { matrix, productNameFallback } = await collectHsMonthRegionData(hsSgn, months);
@@ -735,11 +742,20 @@ async function main() {
 
     const results = [];
 
+const latestYymm = await findLatestAvailableYymm({ hsSgn: "" });
+
+console.log(`[GLOBAL] latest_yymm=${latestYymm}`);
+
     for (const hs of HS_LIST) {
       console.log(`Building cache for ${hs}...`);
 
       try {
-        const result = await buildOneHs(client, hs, DEFAULT_FROM_YYMM);
+        const result = await buildOneHs(
+  client,
+  hs,
+  DEFAULT_FROM_YYMM,
+  latestYymm
+);
         results.push(result);
         console.log(`✅ Completed ${hs}`);
       } catch (err) {
