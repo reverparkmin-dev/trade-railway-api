@@ -82,7 +82,7 @@ const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 1500);
 const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 5000);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5);
 
-const GROWTH_MIN_AMOUNT_USD = Number(process.env.GROWTH_MIN_AMOUNT_USD || 500);
+const GROWTH_MIN_AMOUNT_USD = Number(process.env.GROWTH_MIN_AMOUNT_USD || 1000000);
 const GROWTH_TOP_LIMIT = Number(process.env.GROWTH_TOP_LIMIT || 5);
 
 function cleanNumber(value) {
