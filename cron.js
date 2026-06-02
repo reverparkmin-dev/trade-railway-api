@@ -78,9 +78,9 @@ const HS_LIST = [
 ];
 
 const DEFAULT_FROM_YYMM = process.env.TRADE_FROM_YYMM || "202401";
-const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 1500);
-const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 5000);
-const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5);
+const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 1000);
+const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 2000);
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
 
 const GROWTH_MIN_AMOUNT_USD = Number(process.env.GROWTH_MIN_AMOUNT_USD || 1000000);
 const GROWTH_TOP_LIMIT = Number(process.env.GROWTH_TOP_LIMIT || 5);
@@ -385,6 +385,40 @@ async function upsertGrowthRanking(client, latestYymm, payload) {
   );
 }
 
+async function getExistingTimeseries(client, hsCode, regionCode) {
+  const result = await client.query(
+    `
+    SELECT payload
+    FROM trade_cache_timeseries
+    WHERE hs_code = $1 AND region_code = $2
+    LIMIT 1
+    `,
+    [hsCode, regionCode]
+  );
+
+  if (result.rows.length === 0) return [];
+
+  const payload = result.rows[0].payload || {};
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
+async function getExistingDetailItems(client, hsCode, regionCode) {
+  const result = await client.query(
+    `
+    SELECT payload
+    FROM trade_cache_detail
+    WHERE hs_code = $1 AND region_code = $2
+    LIMIT 1
+    `,
+    [hsCode, regionCode]
+  );
+
+  if (result.rows.length === 0) return [];
+
+  const payload = result.rows[0].payload || {};
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
 function pickTotalLikeRow(items) {
   return (
     items.find((item) => !item.hs_code) ||
@@ -404,7 +438,7 @@ function createEmptySummary(hsCode, regionCode, yymm, productName = "") {
     yymm,
     hs_code: hsCode,
     region_code: regionCode,
-    region_name: regionCode === "ALL" ? "전체" : (REGION_NAME_MAP[regionCode] || regionCode),
+    region_name: regionCode === "ALL" ? "전체" : REGION_NAME_MAP[regionCode] || regionCode,
     product_name: productName,
     export_usd: 0,
     import_usd: 0,
@@ -414,15 +448,52 @@ function createEmptySummary(hsCode, regionCode, yymm, productName = "") {
   };
 }
 
-async function collectHsMonthRegionData(hsSgn, months) {
+async function collectHsMonthRegionData(client, hsSgn, months) {
   const matrix = {};
   let productNameFallback = "";
+  let apiCallCount = 0;
+  let reusedCount = 0;
 
   for (const yymm of months) {
     matrix[yymm] = {};
+  }
 
-    for (const regionCode of CORE_REGION_CODES) {
+  for (const regionCode of CORE_REGION_CODES) {
+    const existingSeries = await getExistingTimeseries(client, hsSgn, regionCode);
+
+    for (const row of existingSeries) {
+      const yymm = String(row.yymm || "");
+      if (!months.includes(yymm)) continue;
+
+      if (!productNameFallback && row.product_name) {
+        productNameFallback = row.product_name;
+      }
+
+      matrix[yymm][regionCode] = {
+        summary: {
+          yymm,
+          hs_code: hsSgn,
+          region_code: regionCode,
+          region_name: REGION_NAME_MAP[regionCode] || regionCode,
+          product_name: row.product_name || productNameFallback || "",
+          export_usd: cleanNumber(row.export_usd),
+          import_usd: cleanNumber(row.import_usd),
+          trade_balance_usd: cleanNumber(row.trade_balance_usd),
+          export_count: cleanNumber(row.export_count),
+          import_count: cleanNumber(row.import_count)
+        },
+        detailItems: []
+      };
+
+      reusedCount += 1;
+    }
+
+    for (const yymm of months) {
+      if (matrix[yymm][regionCode]?.summary) continue;
+
       const items = await fetchTradeMonth({ yymm, hsSgn, sidoCd: regionCode });
+      apiCallCount += 1;
+
       const target = pickTotalLikeRow(items);
 
       if (!productNameFallback && target.product_name) {
@@ -447,9 +518,15 @@ async function collectHsMonthRegionData(hsSgn, months) {
     }
   }
 
+  console.log(
+    `[${hsSgn}] reused=${reusedCount}, api_calls=${apiCallCount}, months=${months.length}, regions=${CORE_REGION_CODES.length}`
+  );
+
   return {
     matrix,
-    productNameFallback
+    productNameFallback,
+    apiCallCount,
+    reusedCount
   };
 }
 
@@ -460,11 +537,16 @@ async function buildOneHs(
   latestYymmOverride = null
 ) {
   const latestYymm =
-  latestYymmOverride ||
-  await findLatestAvailableYymm({ hsSgn });
+    latestYymmOverride ||
+    (await findLatestAvailableYymm({ hsSgn }));
+
   const months = getMonthRange(from, latestYymm);
 
-  const { matrix, productNameFallback } = await collectHsMonthRegionData(hsSgn, months);
+  const { matrix, productNameFallback } = await collectHsMonthRegionData(
+    client,
+    hsSgn,
+    months
+  );
 
   const latestRegionRows = CORE_REGION_CODES.map((regionCode) => {
     const row =
@@ -480,7 +562,10 @@ async function buildOneHs(
     };
   });
 
-  const totalAllLatest = latestRegionRows.reduce((sum, cur) => sum + (cur.export_usd || 0), 0);
+  const totalAllLatest = latestRegionRows.reduce(
+    (sum, cur) => sum + (cur.export_usd || 0),
+    0
+  );
 
   const regionRows = [
     {
@@ -501,7 +586,10 @@ async function buildOneHs(
       return b.export_usd - a.export_usd;
     });
 
-  const totalExportUsd = latestRegionRows.reduce((sum, cur) => sum + (cur.export_usd || 0), 0);
+  const totalExportUsd = latestRegionRows.reduce(
+    (sum, cur) => sum + (cur.export_usd || 0),
+    0
+  );
 
   const regionPayload = {
     success: true,
@@ -534,7 +622,11 @@ async function buildOneHs(
       };
     });
 
-    const latestDetailItems = matrix[latestYymm]?.[regionCode]?.detailItems || [];
+    let latestDetailItems = matrix[latestYymm]?.[regionCode]?.detailItems || [];
+
+    if (latestDetailItems.length === 0) {
+      latestDetailItems = await getExistingDetailItems(client, hsSgn, regionCode);
+    }
 
     const timeseriesPayload = {
       success: true,
@@ -745,22 +837,26 @@ async function main() {
     await client.connect();
     await createTables(client);
 
+    const latestYymm = await findLatestAvailableYymm({ hsSgn: "" });
+    const months = getMonthRange(DEFAULT_FROM_YYMM, latestYymm);
+
+    console.log(`[GLOBAL] latest_yymm=${latestYymm}`);
+    console.log(
+      `[PLAN] hs=${HS_LIST.length}, regions=${CORE_REGION_CODES.length}, months=${months.length}, max_possible_calls=${HS_LIST.length * CORE_REGION_CODES.length * months.length}`
+    );
+
     const results = [];
-
-const latestYymm = await findLatestAvailableYymm({ hsSgn: "" });
-
-console.log(`[GLOBAL] latest_yymm=${latestYymm}`);
 
     for (const hs of HS_LIST) {
       console.log(`Building cache for ${hs}...`);
 
       try {
         const result = await buildOneHs(
-  client,
-  hs,
-  DEFAULT_FROM_YYMM,
-  latestYymm
-);
+          client,
+          hs,
+          DEFAULT_FROM_YYMM,
+          latestYymm
+        );
         results.push(result);
         console.log(`✅ Completed ${hs}`);
       } catch (err) {
@@ -773,6 +869,7 @@ console.log(`[GLOBAL] latest_yymm=${latestYymm}`);
     await upsertMeta(client, "latest", {
       success: true,
       generated_at: new Date().toISOString(),
+      latest_yymm: latestYymm,
       items: results
     });
 
