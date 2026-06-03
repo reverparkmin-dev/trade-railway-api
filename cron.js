@@ -77,7 +77,8 @@ const HS_LIST = [
   "940429"
 ];
 
-const DEFAULT_FROM_YYMM = process.env.TRADE_FROM_YYMM || "202401";
+const TRADE_HISTORY_MONTHS = Number(process.env.TRADE_HISTORY_MONTHS || 36);
+
 const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS || 1000);
 const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 2000);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
@@ -142,6 +143,20 @@ function getMonthRange(from, to) {
   }
 
   return result;
+}
+
+function getRollingFromYymm(latestYymm, months = TRADE_HISTORY_MONTHS) {
+  let y = Number(String(latestYymm).slice(0, 4));
+  let m = Number(String(latestYymm).slice(4, 6));
+
+  m -= months - 1;
+
+  while (m <= 0) {
+    m += 12;
+    y -= 1;
+  }
+
+  return `${y}${String(m).padStart(2, "0")}`;
 }
 
 async function parseApiResponse(data) {
@@ -533,14 +548,15 @@ async function collectHsMonthRegionData(client, hsSgn, months) {
 async function buildOneHs(
   client,
   hsSgn,
-  from = DEFAULT_FROM_YYMM,
+  from = null,
   latestYymmOverride = null
 ) {
   const latestYymm =
     latestYymmOverride ||
     (await findLatestAvailableYymm({ hsSgn }));
 
-  const months = getMonthRange(from, latestYymm);
+  const effectiveFrom = from || getRollingFromYymm(latestYymm);
+  const months = getMonthRange(effectiveFrom, latestYymm);
 
   const { matrix, productNameFallback } = await collectHsMonthRegionData(
     client,
@@ -633,7 +649,7 @@ async function buildOneHs(
       latest_yymm: latestYymm,
       hsSgn,
       sidoCd: regionCode,
-      from,
+      from: effectiveFrom,
       to: latestYymm,
       count: timeseries.length,
       items: timeseries
@@ -698,7 +714,7 @@ async function buildOneHs(
     latest_yymm: latestYymm,
     hsSgn,
     sidoCd: "ALL",
-    from,
+    from: effectiveFrom,
     to: latestYymm,
     count: allTimeseries.length,
     items: allTimeseries
@@ -718,7 +734,8 @@ async function buildOneHs(
 
   return {
     hsSgn,
-    latest_yymm: latestYymm
+    latest_yymm: latestYymm,
+    from: effectiveFrom
   };
 }
 
@@ -837,10 +854,18 @@ async function main() {
     await client.connect();
     await createTables(client);
 
+    if (process.env.TRADE_FROM_YYMM) {
+      console.warn(
+        `[WARN] TRADE_FROM_YYMM=${process.env.TRADE_FROM_YYMM} is ignored. Using rolling ${TRADE_HISTORY_MONTHS} months instead.`
+      );
+    }
+
     const latestYymm = await findLatestAvailableYymm({ hsSgn: "" });
-    const months = getMonthRange(DEFAULT_FROM_YYMM, latestYymm);
+    const effectiveFrom = getRollingFromYymm(latestYymm);
+    const months = getMonthRange(effectiveFrom, latestYymm);
 
     console.log(`[GLOBAL] latest_yymm=${latestYymm}`);
+    console.log(`[GLOBAL] rolling_from=${effectiveFrom}, history_months=${TRADE_HISTORY_MONTHS}`);
     console.log(
       `[PLAN] hs=${HS_LIST.length}, regions=${CORE_REGION_CODES.length}, months=${months.length}, max_possible_calls=${HS_LIST.length * CORE_REGION_CODES.length * months.length}`
     );
@@ -854,7 +879,7 @@ async function main() {
         const result = await buildOneHs(
           client,
           hs,
-          DEFAULT_FROM_YYMM,
+          effectiveFrom,
           latestYymm
         );
         results.push(result);
@@ -870,6 +895,8 @@ async function main() {
       success: true,
       generated_at: new Date().toISOString(),
       latest_yymm: latestYymm,
+      from: effectiveFrom,
+      history_months: TRADE_HISTORY_MONTHS,
       items: results
     });
 
